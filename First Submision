@@ -1,0 +1,404 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title TournamentBettingVault
+ * @dev ERC4626-compliant tournament betting vault where users bet on teams
+ * Winners share the total pool based on their deposit proportions
+ */
+contract TournamentBettingVault is ERC4626, Ownable, ReentrancyGuard, Pausable {
+    // Tournament states
+    enum TournamentState {
+        Registration,  // Users can deposit and join
+        Active,        // Tournament is ongoing, no new deposits
+        Finished,      // Tournament ended, winner set
+        Claimed        // Winnings have been distributed
+    }
+
+    // Structs
+    struct TeamInfo {
+        string name;
+        uint256 totalDeposits;
+        uint256 participantCount;
+        bool exists;
+    }
+
+    struct UserBet {
+        uint256 teamId;
+        uint256 depositAmount;
+        uint256 shares;
+        bool hasClaimed;
+        bool hasJoined;
+    }
+
+    // State variables
+    TournamentState public tournamentState;
+    uint256 public participationFee;
+    uint256 public winningTeamId;
+    uint256 public totalTeams;
+    uint256 public tournamentStartTime;
+    uint256 public registrationDeadline;
+    
+    // Mappings
+    mapping(uint256 => TeamInfo) public teams;
+    mapping(address => UserBet) public userBets;
+    mapping(uint256 => address[]) public teamParticipants;
+    
+    // Arrays for team management
+    uint256[] public teamIds;
+    
+    // Events
+    event TeamAdded(uint256 indexed teamId, string name);
+    event UserDeposited(address indexed user, uint256 teamId, uint256 amount, uint256 shares);
+    event UserJoinedTournament(address indexed user, uint256 teamId);
+    event TournamentStarted(uint256 startTime);
+    event WinnerSet(uint256 indexed winningTeamId);
+    event WinningsWithdrawn(address indexed user, uint256 amount);
+    event ParticipationFeeSet(uint256 newFee);
+
+    // Modifiers
+    modifier onlyDuringRegistration() {
+        require(tournamentState == TournamentState.Registration, "Registration period ended");
+        require(block.timestamp < registrationDeadline, "Registration deadline passed");
+        _;
+    }
+
+    modifier onlyAfterTournament() {
+        require(tournamentState == TournamentState.Finished, "Tournament not finished");
+        _;
+    }
+
+    modifier validTeam(uint256 teamId) {
+        require(teams[teamId].exists, "Team does not exist");
+        _;
+    }
+
+    modifier hasDeposited() {
+        require(userBets[msg.sender].depositAmount > 0, "Must deposit before joining");
+        _;
+    }
+
+    modifier hasNotJoined() {
+        require(!userBets[msg.sender].hasJoined, "Already joined tournament");
+        _;
+    }
+
+    /**
+     * @dev Constructor
+     * @param _asset The underlying ERC20 token
+     * @param _participationFee Fee required to participate
+     * @param _registrationPeriod Time in seconds for registration period
+     */
+    constructor(
+        IERC20 _asset,
+        uint256 _participationFee,
+        uint256 _registrationPeriod
+    ) 
+        ERC4626(_asset) 
+        ERC20("Tournament Betting Vault", "TBV")
+        Ownable(msg.sender)
+    {
+        participationFee = _participationFee;
+        registrationDeadline = block.timestamp + _registrationPeriod;
+        tournamentState = TournamentState.Registration;
+    }
+
+    /**
+     * @dev Add a team to the tournament (only owner)
+     * @param teamId Unique identifier for the team
+     * @param name Team name
+     */
+    function addTeam(uint256 teamId, string memory name) external onlyOwner {
+        require(!teams[teamId].exists, "Team already exists");
+        require(tournamentState == TournamentState.Registration, "Cannot add teams after registration");
+        
+        teams[teamId] = TeamInfo({
+            name: name,
+            totalDeposits: 0,
+            participantCount: 0,
+            exists: true
+        });
+        
+        teamIds.push(teamId);
+        totalTeams++;
+        
+        emit TeamAdded(teamId, name);
+    }
+
+    /**
+     * @dev Set participation fee (only owner, during registration)
+     * @param _newFee New participation fee amount
+     */
+    function setParticipationFee(uint256 _newFee) external onlyOwner onlyDuringRegistration {
+        participationFee = _newFee;
+        emit ParticipationFeeSet(_newFee);
+    }
+
+    /**
+     * @dev Deposit assets to bet on a team
+     * @param assets Amount of assets to deposit
+     * @param receiver Address to receive vault shares
+     * @param teamId Team to bet on
+     */
+    function depositForTeam(
+        uint256 assets, 
+        address receiver, 
+        uint256 teamId
+    ) 
+        external 
+        onlyDuringRegistration 
+        validTeam(teamId) 
+        nonReentrant 
+        returns (uint256 shares) 
+    {
+        require(assets > 0, "Cannot deposit zero assets");
+        require(userBets[receiver].depositAmount == 0, "User already has a bet");
+        
+        // Calculate shares using ERC4626 logic
+        shares = previewDeposit(assets);
+        
+        // Transfer assets from user
+        IERC20(asset()).transferFrom(msg.sender, address(this), assets);
+        
+        // Mint shares to receiver
+        _mint(receiver, shares);
+        
+        // Update user bet info
+        userBets[receiver] = UserBet({
+            teamId: teamId,
+            depositAmount: assets,
+            shares: shares,
+            hasClaimed: false,
+            hasJoined: false
+        });
+        
+        // Update team info
+        teams[teamId].totalDeposits += assets;
+        
+        emit UserDeposited(receiver, teamId, assets, shares);
+        
+        return shares;
+    }
+
+    /**
+     * @dev Join tournament after making deposit (requires participation fee)
+     * @param teamId Team to join (must match deposited team)
+     */
+    function joinTournament(uint256 teamId) 
+        external 
+        payable 
+        onlyDuringRegistration 
+        validTeam(teamId) 
+        hasDeposited 
+        hasNotJoined 
+        nonReentrant 
+    {
+        require(msg.value >= participationFee, "Insufficient participation fee");
+        require(userBets[msg.sender].teamId == teamId, "Team mismatch with deposit");
+        
+        // Mark user as joined
+        userBets[msg.sender].hasJoined = true;
+        
+        // Add to team participants
+        teamParticipants[teamId].push(msg.sender);
+        teams[teamId].participantCount++;
+        
+        // Refund excess payment
+        if (msg.value > participationFee) {
+            payable(msg.sender).transfer(msg.value - participationFee);
+        }
+        
+        emit UserJoinedTournament(msg.sender, teamId);
+    }
+
+    /**
+     * @dev Start the tournament (only owner)
+     */
+    function startTournament() external onlyOwner {
+        require(tournamentState == TournamentState.Registration, "Tournament already started");
+        require(totalTeams >= 2, "Need at least 2 teams");
+        
+        tournamentState = TournamentState.Active;
+        tournamentStartTime = block.timestamp;
+        
+        emit TournamentStarted(block.timestamp);
+    }
+
+    /**
+     * @dev Set the winning team (only owner, after tournament)
+     * @param _winningTeamId ID of the winning team
+     */
+    function setWinner(uint256 _winningTeamId) external onlyOwner validTeam(_winningTeamId) {
+        require(tournamentState == TournamentState.Active, "Tournament not active");
+        
+        winningTeamId = _winningTeamId;
+        tournamentState = TournamentState.Finished;
+        
+        emit WinnerSet(_winningTeamId);
+    }
+
+    /**
+     * @dev Withdraw winnings (only winners after tournament)
+     */
+    function withdrawWinnings() external onlyAfterTournament nonReentrant {
+        UserBet storage userBet = userBets[msg.sender];
+        
+        require(userBet.hasJoined, "User did not join tournament");
+        require(userBet.teamId == winningTeamId, "User did not bet on winning team");
+        require(!userBet.hasClaimed, "Already claimed winnings");
+        
+        userBet.hasClaimed = true;
+        
+        // Calculate user's share of total winnings
+        uint256 totalAssets = totalAssets();
+        uint256 winningTeamShares = getTeamTotalShares(winningTeamId);
+        uint256 userWinnings = (userBet.shares * totalAssets) / winningTeamShares;
+        
+        // Burn user's shares
+        _burn(msg.sender, userBet.shares);
+        
+        // Transfer winnings
+        IERC20(asset()).transfer(msg.sender, userWinnings);
+        
+        emit WinningsWithdrawn(msg.sender, userWinnings);
+    }
+
+    /**
+     * @dev Emergency withdraw for losers (get back participation fee only)
+     */
+    function emergencyWithdraw() external onlyAfterTournament nonReentrant {
+        UserBet storage userBet = userBets[msg.sender];
+        
+        require(userBet.hasJoined, "User did not join tournament");
+        require(userBet.teamId != winningTeamId, "Winners should use withdrawWinnings");
+        require(!userBet.hasClaimed, "Already claimed");
+        
+        userBet.hasClaimed = true;
+        
+        // Burn user's shares (they lost)
+        _burn(msg.sender, userBet.shares);
+        
+        // Return only participation fee (if contract has enough ETH)
+        if (address(this).balance >= participationFee) {
+            payable(msg.sender).transfer(participationFee);
+        }
+    }
+
+    /**
+     * @dev Get total shares for a specific team
+     * @param teamId Team ID
+     * @return Total shares held by team members
+     */
+    function getTeamTotalShares(uint256 teamId) public view returns (uint256) {
+        uint256 totalShares = 0;
+        address[] memory participants = teamParticipants[teamId];
+        
+        for (uint256 i = 0; i < participants.length; i++) {
+            totalShares += userBets[participants[i]].shares;
+        }
+        
+        return totalShares;
+    }
+
+    /**
+     * @dev Get team participants
+     * @param teamId Team ID
+     * @return Array of participant addresses
+     */
+    function getTeamParticipants(uint256 teamId) external view returns (address[] memory) {
+        return teamParticipants[teamId];
+    }
+
+    /**
+     * @dev Get all team IDs
+     * @return Array of team IDs
+     */
+    function getAllTeamIds() external view returns (uint256[] memory) {
+        return teamIds;
+    }
+
+    /**
+     * @dev Owner can withdraw participation fees
+     */
+    function withdrawFees() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No fees to withdraw");
+        
+        payable(owner()).transfer(balance);
+    }
+
+    /**
+     * @dev Pause contract (emergency)
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @dev Override deposit to prevent direct deposits (must use depositForTeam)
+     */
+    function deposit(uint256, address) public pure override returns (uint256) {
+        revert("Use depositForTeam instead");
+    }
+
+    /**
+     * @dev Override mint to prevent direct minting
+     */
+    function mint(uint256, address) public pure override returns (uint256) {
+        revert("Use depositForTeam instead");
+    }
+
+    /**
+     * @dev Override redeem to prevent redemption during active tournament
+     */
+    function redeem(uint256, address, address) public view override returns (uint256) {
+        require(tournamentState == TournamentState.Finished, "Cannot redeem during tournament");
+        revert("Use withdrawWinnings instead");
+    }
+
+    /**
+     * @dev Override withdraw to prevent withdrawal during active tournament
+     */
+    function withdraw(uint256, address, address) public view override returns (uint256) {
+        require(tournamentState == TournamentState.Finished, "Cannot withdraw during tournament");
+        revert("Use withdrawWinnings instead");
+    }
+
+    /**
+     * @dev Get contract state information
+     */
+    function getContractInfo() external view returns (
+        TournamentState state,
+        uint256 totalTeamsCount,
+        uint256 regDeadline,
+        uint256 startTime,
+        uint256 winningTeam,
+        uint256 totalPooled
+    ) {
+        return (
+            tournamentState,
+            totalTeams,
+            registrationDeadline,
+            tournamentStartTime,
+            winningTeamId,
+            totalAssets()
+        );
+    }
+
+    /**
+     * @dev Receive function to accept ETH for participation fees
+     */
+    receive() external payable {}
+}
